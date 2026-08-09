@@ -1,923 +1,854 @@
-document.addEventListener('DOMContentLoaded', () => {
-    const app = document.getElementById('app-content');
-    const canvas = document.getElementById('box-canvas');
-    const ctx = canvas ? canvas.getContext('2d') : null;
-    if (!app || !canvas || !ctx) {
+import {
+    EXERCISES,
+    SessionEngine,
+    buildPhases,
+    getCycleDurationMs,
+    sanitiseRoutine
+} from './session-engine.js';
+
+const app = document.querySelector('#app');
+const settingsLayer = document.querySelector('#settings-layer');
+const toast = document.querySelector('#toast');
+const phaseAnnouncer = document.querySelector('#phase-announcer');
+const hapticProxy = document.querySelector('#ios-haptic-switch');
+
+const SETTINGS_KEY = 'quietBreath.settings.v2';
+const LEGACY_KEY = 'breathingExercisesSettings';
+const DEFAULT_SETTINGS = Object.freeze({
+    soundEnabled: false,
+    soundVolume: 30,
+    hapticsEnabled: false,
+    countdownEnabled: false,
+    extraDim: true,
+    lastRoutine: null
+});
+
+let settings = loadSettings();
+let draftRoutine = sanitiseRoutine(settings.lastRoutine || {
+    exerciseId: 'box',
+    phaseTime: 4,
+    exhaleDuration: 6,
+    targetType: 'open',
+    targetValue: 0
+});
+let currentView = settings.lastRoutine ? 'home' : 'configure';
+let settingsOpen = false;
+let lastCompletion = null;
+let lastFrame = null;
+let hideChromeTimer = null;
+let toastTimer = null;
+let toastAction = null;
+let audioContext = null;
+let wakeLockSentinel = null;
+let deferredInstallPrompt = null;
+let serviceWorkerRegistration = null;
+let updateReady = false;
+let isRefreshingForUpdate = false;
+let pausedByInterruption = false;
+let lastDisplayedSecond = -1;
+
+const reducedMotionQuery = window.matchMedia?.('(prefers-reduced-motion: reduce)');
+
+const engine = new SessionEngine({
+    onTick: updateSessionFrame,
+    onPhaseChange: handlePhaseChange,
+    onStatusChange: handleStatusChange,
+    onComplete: handleCompletion
+});
+
+function loadSettings() {
+    const defaults = { ...DEFAULT_SETTINGS };
+    try {
+        const saved = JSON.parse(localStorage.getItem(SETTINGS_KEY));
+        if (saved && typeof saved === 'object') {
+            return normaliseSettings(saved);
+        }
+
+        const legacy = JSON.parse(localStorage.getItem(LEGACY_KEY));
+        if (legacy && typeof legacy === 'object') {
+            const migrated = normaliseSettings({
+                ...defaults,
+                soundEnabled: legacy.soundEnabled,
+                countdownEnabled: legacy.countdownEnabled,
+                lastRoutine: {
+                    exerciseId: legacy.exerciseType,
+                    phaseTime: legacy.phaseTime,
+                    exhaleDuration: legacy.exhaleDuration,
+                    targetType: 'open',
+                    targetValue: 0
+                }
+            });
+            localStorage.setItem(SETTINGS_KEY, JSON.stringify(migrated));
+            return migrated;
+        }
+    } catch (error) {
+        console.warn('Quiet Breath could not read saved preferences.', error);
+    }
+    return defaults;
+}
+
+function normaliseSettings(candidate) {
+    const lastRoutine = candidate.lastRoutine ? sanitiseRoutine(candidate.lastRoutine) : null;
+    return {
+        soundEnabled: typeof candidate.soundEnabled === 'boolean' ? candidate.soundEnabled : false,
+        soundVolume: clampNumber(candidate.soundVolume, 0, 100, 30),
+        hapticsEnabled: typeof candidate.hapticsEnabled === 'boolean' ? candidate.hapticsEnabled : false,
+        countdownEnabled: typeof candidate.countdownEnabled === 'boolean' ? candidate.countdownEnabled : false,
+        extraDim: typeof candidate.extraDim === 'boolean' ? candidate.extraDim : true,
+        lastRoutine
+    };
+}
+
+function saveSettings() {
+    try {
+        localStorage.setItem(SETTINGS_KEY, JSON.stringify(settings));
+    } catch (error) {
+        console.warn('Quiet Breath could not save preferences.', error);
+    }
+}
+
+function clampNumber(value, min, max, fallback) {
+    const parsed = Number(value);
+    return Number.isFinite(parsed) ? Math.min(max, Math.max(min, parsed)) : fallback;
+}
+
+function escapeHtml(value) {
+    return String(value)
+        .replaceAll('&', '&amp;')
+        .replaceAll('<', '&lt;')
+        .replaceAll('>', '&gt;')
+        .replaceAll('"', '&quot;')
+        .replaceAll("'", '&#039;');
+}
+
+function formatElapsed(milliseconds) {
+    const totalSeconds = Math.max(0, Math.floor(milliseconds / 1000));
+    const minutes = Math.floor(totalSeconds / 60);
+    const seconds = totalSeconds % 60;
+    return `${String(minutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')}`;
+}
+
+function formatLongDuration(milliseconds) {
+    const totalSeconds = Math.max(0, Math.round(milliseconds / 1000));
+    const minutes = Math.floor(totalSeconds / 60);
+    const seconds = totalSeconds % 60;
+    if (minutes === 0) return `${seconds} second${seconds === 1 ? '' : 's'}`;
+    if (seconds === 0) return `${minutes} minute${minutes === 1 ? '' : 's'}`;
+    return `${minutes} min ${seconds} sec`;
+}
+
+function formatTarget(routine) {
+    if (routine.targetType === 'open') return 'Open-ended';
+    if (routine.targetType === 'rounds') {
+        return `${routine.targetValue} round${routine.targetValue === 1 ? '' : 's'}`;
+    }
+    return `${routine.targetValue} minute${routine.targetValue === 1 ? '' : 's'}`;
+}
+
+function formatRoutineDetail(routine) {
+    const exercise = EXERCISES[routine.exerciseId];
+    const pacing = exercise.adjustable
+        ? `${routine[exercise.adjustable.key]} second ${exercise.adjustable.label.toLowerCase()}`
+        : '4 · 7 · 8 seconds';
+    return `${formatTarget(routine)} · ${pacing}`;
+}
+
+function topbar({ back = false } = {}) {
+    return `
+        <header class="topbar">
+            ${back ? '<button class="text-button" type="button" data-action="back">Back</button>' : '<p class="wordmark">Quiet Breath</p>'}
+            <button class="text-button" type="button" data-action="open-settings" aria-haspopup="dialog">Settings</button>
+        </header>
+    `;
+}
+
+function render() {
+    document.body.classList.toggle('extra-dim', settings.extraDim);
+    if (currentView === 'configure') renderConfigure();
+    else if (currentView === 'session') renderSession();
+    else if (currentView === 'complete') renderComplete();
+    else renderHome();
+    if (settingsOpen) renderSettingsSheet();
+}
+
+function renderHome() {
+    const routine = sanitiseRoutine(settings.lastRoutine || draftRoutine);
+    const exercise = EXERCISES[routine.exerciseId];
+    app.innerHTML = `
+        <section class="screen home-screen" aria-labelledby="home-title">
+            ${topbar()}
+            <div class="home-content">
+                <p class="eyebrow">Your quiet space</p>
+                <h1 id="home-title">Ready when you are.</h1>
+                <p class="lead">Settle in and return to your last breathing rhythm.</p>
+                <div class="routine-card" aria-label="Last breathing routine">
+                    <span class="routine-name">${escapeHtml(exercise.name)}</span>
+                    <span class="routine-detail">${escapeHtml(formatRoutineDetail(routine))}</span>
+                </div>
+                <button class="primary-button" type="button" data-action="begin-last">Begin again</button>
+                <button class="secondary-button" type="button" data-action="change-routine">Change routine</button>
+                <p class="safety-note">Breathe comfortably. Stop if you feel light-headed or unwell.</p>
+            </div>
+        </section>
+    `;
+}
+
+function renderConfigure() {
+    const routine = sanitiseRoutine(draftRoutine);
+    draftRoutine = routine;
+    const exercise = EXERCISES[routine.exerciseId];
+    const targetValues = routine.exerciseId === 'fourSevenEight' ? [4, 6, 8] : [2, 5, 10];
+    const expectedType = routine.exerciseId === 'fourSevenEight' ? 'rounds' : 'minutes';
+    const isPreset = routine.targetType === expectedType && targetValues.includes(routine.targetValue);
+    const isCustom = routine.targetType === expectedType && !isPreset;
+    const targetUnit = routine.exerciseId === 'fourSevenEight' ? 'rounds' : 'minutes';
+    const adjustable = exercise.adjustable;
+
+    app.innerHTML = `
+        <section class="screen setup-screen" aria-labelledby="config-title">
+            ${topbar({ back: Boolean(settings.lastRoutine) })}
+            <div class="config-content">
+                <div class="config-intro">
+                    <p class="eyebrow">Choose a rhythm</p>
+                    <h1 id="config-title" class="config-heading">A breath that fits this moment.</h1>
+                    <p class="lead">Keep it simple. You can change the pace whenever you return.</p>
+                </div>
+                <div class="config-form">
+                    <span class="section-label" id="exercise-label">Exercise</span>
+                    <div class="exercise-grid" role="radiogroup" aria-labelledby="exercise-label">
+                        ${Object.values(EXERCISES).map((item) => `
+                            <button class="exercise-card" type="button" role="radio" aria-checked="${item.id === routine.exerciseId}" data-action="select-exercise" data-exercise="${item.id}">
+                                <span class="exercise-title">${escapeHtml(item.name)}</span>
+                                <span class="exercise-description">${escapeHtml(item.description)}</span>
+                            </button>
+                        `).join('')}
+                    </div>
+
+                    <span class="section-label" id="duration-label">Duration</span>
+                    <div class="choice-row" role="radiogroup" aria-labelledby="duration-label">
+                        <button class="choice-chip" type="button" role="radio" aria-checked="${routine.targetType === 'open'}" data-action="select-target" data-target-type="open" data-target-value="0">Open</button>
+                        ${targetValues.map((value) => `
+                            <button class="choice-chip" type="button" role="radio" aria-checked="${routine.targetType === expectedType && routine.targetValue === value}" data-action="select-target" data-target-type="${expectedType}" data-target-value="${value}">${value} ${routine.exerciseId === 'fourSevenEight' ? 'rounds' : 'min'}</button>
+                        `).join('')}
+                        <button class="choice-chip" type="button" role="radio" aria-checked="${isCustom}" data-action="select-target" data-target-type="${expectedType}" data-target-value="custom">Custom</button>
+                    </div>
+                    ${isCustom ? `
+                        <label class="custom-field" for="custom-target">
+                            <input class="number-input" id="custom-target" name="custom-target" type="number" inputmode="numeric" min="1" max="${routine.exerciseId === 'fourSevenEight' ? '99' : '120'}" value="${routine.targetValue}">
+                            <span class="field-unit">${targetUnit}</span>
+                        </label>
+                    ` : ''}
+
+                    ${adjustable ? `
+                        <label class="section-label" for="phase-range">${escapeHtml(adjustable.label)}</label>
+                        <div class="range-panel">
+                            <input id="phase-range" type="range" min="${adjustable.min}" max="${adjustable.max}" step="${adjustable.step}" value="${routine[adjustable.key]}" data-setting-key="${adjustable.key}">
+                            <output class="range-value" id="phase-range-output" for="phase-range">${routine[adjustable.key]} sec</output>
+                        </div>
+                    ` : ''}
+
+                    <div class="config-actions">
+                        <button class="primary-button" type="button" data-action="start-session">Begin</button>
+                        <p class="safety-note">Breathe comfortably. Stop if you feel light-headed or unwell.</p>
+                    </div>
+                </div>
+            </div>
+        </section>
+    `;
+}
+
+function renderSession() {
+    const routine = sanitiseRoutine(settings.lastRoutine || draftRoutine);
+    const initialPhase = buildPhases(routine)[0];
+    currentView = 'session';
+    app.innerHTML = `
+        <section class="session-screen" id="session-screen" data-phase="${initialPhase.name}" aria-labelledby="phase-word">
+            <header class="session-header session-chrome">
+                <p class="wordmark">Quiet Breath</p>
+                <span class="session-time" id="session-time">00:00</span>
+                <button class="quiet-button" type="button" data-action="open-settings" aria-haspopup="dialog">Settings</button>
+            </header>
+            <div class="breath-stage">
+                <div class="phase-copy">
+                    <h1 class="phase-word" id="phase-word">${initialPhase.name}</h1>
+                    <p class="phase-countdown" id="phase-countdown">${settings.countdownEnabled ? initialPhase.duration : ''}</p>
+                </div>
+                <div class="breath-form-wrap" aria-hidden="true">
+                    <div class="breath-form" id="breath-form"></div>
+                </div>
+                <p class="session-state" id="session-state">Settling in</p>
+            </div>
+            <div class="session-controls session-chrome">
+                <button class="primary-button" id="pause-button" type="button" data-action="toggle-pause">Pause</button>
+                <button class="secondary-button" type="button" data-action="request-end">End</button>
+            </div>
+            <div id="confirm-layer"></div>
+        </section>
+    `;
+    lastDisplayedSecond = -1;
+    showSessionChrome();
+}
+
+function renderEndConfirmation() {
+    const layer = document.querySelector('#confirm-layer');
+    if (!layer) return;
+    layer.innerHTML = `
+        <div class="confirm-layer" role="dialog" aria-modal="true" aria-labelledby="end-title" aria-describedby="end-description">
+            <div class="confirm-card">
+                <h2 id="end-title">End this session?</h2>
+                <p id="end-description">Your breathing time so far will be shown on the completion screen.</p>
+                <div class="confirm-actions">
+                    <button class="primary-button" type="button" data-action="cancel-end">Continue breathing</button>
+                    <button class="danger-button" type="button" data-action="confirm-end">End session</button>
+                </div>
+            </div>
+        </div>
+    `;
+    layer.querySelector('[data-action="cancel-end"]')?.focus();
+}
+
+function clearEndConfirmation() {
+    const layer = document.querySelector('#confirm-layer');
+    if (layer) layer.innerHTML = '';
+}
+
+function renderComplete() {
+    const routine = sanitiseRoutine(settings.lastRoutine || draftRoutine);
+    const elapsedMs = lastCompletion?.elapsedMs || engine.elapsedMs;
+    const completedRounds = Math.floor((elapsedMs + 0.5) / getCycleDurationMs(routine));
+    const roundCopy = routine.exerciseId === 'fourSevenEight'
+        ? ` · ${completedRounds} complete round${completedRounds === 1 ? '' : 's'}`
+        : '';
+    app.innerHTML = `
+        <section class="screen complete-screen" aria-labelledby="complete-title">
+            ${topbar()}
+            <div class="complete-content">
+                <div class="complete-mark" aria-hidden="true"></div>
+                <p class="eyebrow">Session complete</p>
+                <h1 id="complete-title">A quieter moment.</h1>
+                <p class="completion-stat">${escapeHtml(formatLongDuration(elapsedMs))}${escapeHtml(roundCopy)}</p>
+                <button class="primary-button" type="button" data-action="repeat-session">Repeat</button>
+                <button class="secondary-button" type="button" data-action="done">Done</button>
+            </div>
+        </section>
+    `;
+    if (updateReady) showUpdateToast();
+}
+
+function renderSettingsSheet() {
+    const installed = isStandalone();
+    const isiOS = /iPhone|iPad|iPod/i.test(navigator.userAgent);
+    const connectionCopy = navigator.onLine ? 'Ready online and offline' : 'Offline · the app remains ready';
+    const installCopy = installed
+        ? 'Quiet Breath is installed on this device.'
+        : deferredInstallPrompt
+            ? 'Install Quiet Breath for a full-screen, offline experience.'
+            : isiOS
+                ? 'In Safari, tap Share and then Add to Home Screen.'
+                : 'Use your browser menu to install Quiet Breath when available.';
+    const canInstall = !installed && Boolean(deferredInstallPrompt);
+
+    settingsLayer.innerHTML = `
+        <div class="sheet-backdrop" role="presentation" data-backdrop>
+            <section class="settings-sheet" role="dialog" aria-modal="true" aria-labelledby="settings-title" data-sheet>
+                <div class="sheet-header">
+                    <div>
+                        <p class="eyebrow">Preferences</p>
+                        <h2 id="settings-title">Keep it comfortable.</h2>
+                    </div>
+                    <button class="quiet-button" type="button" data-action="close-settings">Close</button>
+                </div>
+                <p class="settings-intro">Everything stays on this device.</p>
+
+                ${settingSwitch('soundEnabled', 'Sound cues', 'Soft phase notes and a completion bell.', settings.soundEnabled)}
+                <label class="volume-row" for="sound-volume">
+                    <span class="setting-copy">
+                        <span class="setting-name">Cue volume</span>
+                        <span class="setting-note"><span id="volume-output">${settings.soundVolume}</span>% · deliberately limited</span>
+                    </span>
+                    <input id="sound-volume" name="soundVolume" type="range" min="0" max="100" step="5" value="${settings.soundVolume}" ${settings.soundEnabled ? '' : 'disabled'}>
+                </label>
+                ${settingSwitch('hapticsEnabled', 'Haptic cues', 'Best-effort taps for inhale, exhale and completion on supported devices.', settings.hapticsEnabled)}
+                ${settingSwitch('countdownEnabled', 'Countdown', 'Show the seconds remaining in each phase.', settings.countdownEnabled)}
+                ${settingSwitch('extraDim', 'Extra dim', 'Reduce the breathing form glow for bedtime.', settings.extraDim)}
+
+                <div class="status-panel">
+                    <div><span class="status-dot"></span>${escapeHtml(connectionCopy)}</div>
+                    <p class="install-help">${escapeHtml(installCopy)}</p>
+                    ${canInstall ? '<button class="secondary-button" type="button" data-action="install-app">Install Quiet Breath</button>' : ''}
+                    ${updateReady ? `<button class="secondary-button" type="button" data-action="apply-update" ${engine.status === 'running' || engine.status === 'paused' || engine.status === 'ending' ? 'disabled' : ''}>${engine.status === 'running' || engine.status === 'paused' || engine.status === 'ending' ? 'Update ready after this session' : 'Update Quiet Breath'}</button>` : ''}
+                </div>
+            </section>
+        </div>
+    `;
+    settingsLayer.querySelector('[data-action="close-settings"]')?.focus();
+}
+
+function settingSwitch(name, label, note, checked) {
+    return `
+        <label class="setting-row" for="setting-${name}">
+            <span class="setting-copy">
+                <span class="setting-name">${escapeHtml(label)}</span>
+                <span class="setting-note">${escapeHtml(note)}</span>
+            </span>
+            <input id="setting-${name}" name="${name}" type="checkbox" switch ${checked ? 'checked' : ''}>
+        </label>
+    `;
+}
+
+function openSettings() {
+    settingsOpen = true;
+    clearHideChromeTimer();
+    renderSettingsSheet();
+    document.body.style.overflow = 'hidden';
+}
+
+function closeSettings() {
+    settingsOpen = false;
+    settingsLayer.innerHTML = '';
+    document.body.style.overflow = '';
+    if (currentView === 'session' && engine.status === 'running') scheduleChromeHide();
+    app.focus({ preventScroll: true });
+}
+
+function startRoutine(routine) {
+    draftRoutine = sanitiseRoutine(routine);
+    settings.lastRoutine = draftRoutine;
+    saveSettings();
+    currentView = 'session';
+    lastCompletion = null;
+    prepareAudio();
+    renderSession();
+    engine.start(draftRoutine);
+}
+
+function handleAppClick(event) {
+    const control = event.target.closest('[data-action]');
+    if (!control) return;
+    const action = control.dataset.action;
+
+    if (action === 'open-settings') openSettings();
+    else if (action === 'begin-last') startRoutine(settings.lastRoutine);
+    else if (action === 'change-routine') {
+        draftRoutine = sanitiseRoutine(settings.lastRoutine);
+        currentView = 'configure';
+        render();
+    } else if (action === 'select-exercise') {
+        const exerciseId = control.dataset.exercise;
+        const exercise = EXERCISES[exerciseId];
+        draftRoutine = sanitiseRoutine({
+            exerciseId,
+            phaseTime: exerciseId === 'coherent' ? 5 : 4,
+            exhaleDuration: 6,
+            targetType: 'open',
+            targetValue: 0
+        });
+        renderConfigure();
+    } else if (action === 'select-target') {
+        const targetType = control.dataset.targetType;
+        const rawValue = control.dataset.targetValue;
+        const defaultCustom = draftRoutine.exerciseId === 'fourSevenEight' ? 5 : 7;
+        draftRoutine = sanitiseRoutine({
+            ...draftRoutine,
+            targetType,
+            targetValue: rawValue === 'custom' ? defaultCustom : Number(rawValue)
+        });
+        renderConfigure();
+        if (rawValue === 'custom') document.querySelector('#custom-target')?.focus();
+    } else if (action === 'start-session') startRoutine(draftRoutine);
+    else if (action === 'back') {
+        currentView = 'home';
+        renderHome();
+    } else if (action === 'toggle-pause') {
+        if (engine.status === 'running') engine.pause('user');
+        else if (engine.status === 'paused') engine.resume();
+    } else if (action === 'request-end') {
+        if (engine.beginEnding()) renderEndConfirmation();
+    } else if (action === 'cancel-end') {
+        clearEndConfirmation();
+        engine.cancelEnding();
+    } else if (action === 'confirm-end') {
+        clearEndConfirmation();
+        engine.completeManually();
+    } else if (action === 'repeat-session') startRoutine(settings.lastRoutine);
+    else if (action === 'done') {
+        engine.reset();
+        currentView = 'home';
+        renderHome();
+    }
+}
+
+function handleInput(event) {
+    const target = event.target;
+    if (target.id === 'phase-range') {
+        const key = target.dataset.settingKey;
+        draftRoutine = sanitiseRoutine({ ...draftRoutine, [key]: Number(target.value) });
+        const output = document.querySelector('#phase-range-output');
+        if (output) output.textContent = `${draftRoutine[key]} sec`;
+    } else if (target.id === 'custom-target') {
+        draftRoutine = sanitiseRoutine({ ...draftRoutine, targetValue: Number(target.value) });
+    } else if (target.name === 'soundVolume') {
+        settings.soundVolume = clampNumber(target.value, 0, 100, 30);
+        const output = document.querySelector('#volume-output');
+        if (output) output.textContent = settings.soundVolume;
+        saveSettings();
+    }
+}
+
+function handleChange(event) {
+    const target = event.target;
+    if (!['soundEnabled', 'hapticsEnabled', 'countdownEnabled', 'extraDim'].includes(target.name)) return;
+    settings[target.name] = target.checked;
+    if (target.name === 'soundEnabled' && target.checked) prepareAudio();
+    if (target.name === 'extraDim') document.body.classList.toggle('extra-dim', settings.extraDim);
+    saveSettings();
+    renderSettingsSheet();
+    if (currentView === 'session' && lastFrame) updateSessionFrame(lastFrame);
+}
+
+function handleSettingsClick(event) {
+    if (event.target.matches('[data-backdrop]')) {
+        closeSettings();
         return;
     }
-    const layoutHost = canvas.parentElement || document.querySelector('.container');
-    const initialWidth = layoutHost ? layoutHost.clientWidth : canvas.clientWidth;
-    const initialHeight = layoutHost ? layoutHost.clientHeight : canvas.clientHeight;
+    const control = event.target.closest('[data-action]');
+    if (!control) return;
+    const action = control.dataset.action;
+    if (action === 'close-settings') closeSettings();
+    else if (action === 'install-app') installApp();
+    else if (action === 'apply-update') applyUpdate();
+}
 
-    // Exercise type definitions
-    const exerciseTypes = {
-        box: {
-            name: 'Box Breathing',
-            description: 'Equal phases for balance and calm',
-            getPhases: (phaseTime) => [
-                { name: 'Inhale', duration: phaseTime, color: '#f97316' },
-                { name: 'Hold', duration: phaseTime, color: '#fbbf24' },
-                { name: 'Exhale', duration: phaseTime, color: '#38bdf8' },
-                { name: 'Wait', duration: phaseTime, color: '#22c55e' }
-            ],
-            hasPhaseTimeSlider: true,
-            phaseTimeRange: { min: 3, max: 6, step: 1, default: 4 },
-            phaseTimeLabel: 'Phase Time'
-        },
-        fourSevenEight: {
-            name: '4-7-8 Breathing',
-            description: 'Relaxation and sleep aid',
-            getPhases: () => [
-                { name: 'Inhale', duration: 4, color: '#f97316' },
-                { name: 'Hold', duration: 7, color: '#fbbf24' },
-                { name: 'Exhale', duration: 8, color: '#38bdf8' }
-            ],
-            hasPhaseTimeSlider: false
-        },
-        longExhale: {
-            name: 'Long Exhale',
-            description: 'Extended exhale for relaxation',
-            getPhases: (_, exhaleDuration) => [
-                { name: 'Inhale', duration: 4, color: '#f97316' },
-                { name: 'Exhale', duration: exhaleDuration, color: '#38bdf8' }
-            ],
-            hasPhaseTimeSlider: true,
-            phaseTimeRange: { min: 6, max: 8, step: 1, default: 6 },
-            phaseTimeLabel: 'Exhale Time',
-            phaseTimeUnit: 'seconds'
-        },
-        coherent: {
-            name: 'Coherent Breathing',
-            description: 'Equal inhale and exhale for HRV',
-            getPhases: (phaseTime) => [
-                { name: 'Inhale', duration: phaseTime, color: '#f97316' },
-                { name: 'Exhale', duration: phaseTime, color: '#38bdf8' }
-            ],
-            hasPhaseTimeSlider: true,
-            phaseTimeRange: { min: 4.5, max: 6, step: 0.5, default: 5 },
-            phaseTimeLabel: 'Breath Time'
-        }
-    };
+function updateSessionFrame(frame) {
+    lastFrame = frame;
+    if (currentView !== 'session') return;
+    const screen = document.querySelector('#session-screen');
+    const breathForm = document.querySelector('#breath-form');
+    const phaseWord = document.querySelector('#phase-word');
+    const countdown = document.querySelector('#phase-countdown');
+    const timer = document.querySelector('#session-time');
+    const stateLabel = document.querySelector('#session-state');
+    if (!screen || !breathForm || !phaseWord || !countdown || !timer || !stateLabel) return;
 
-    const state = {
-        isPlaying: false,
-        count: 0,
-        countdown: 4,
-        totalTime: 0,
-        soundEnabled: false,
-        countdownEnabled: false,
-        timeLimit: '',
-        sessionComplete: false,
-        timeLimitReached: false,
-        phaseTime: 4,
-        exhaleDuration: 6,
-        exerciseType: 'box',
-        pulseStartTime: null,
-        devicePixelRatio: Math.min(window.devicePixelRatio || 1, 1.75),
-        viewportWidth: initialWidth,
-        viewportHeight: initialHeight,
-        prefersReducedMotion: false,
-        hasStarted: false,
-        startTime: null,
-        targetRounds: 0,
-        completedRounds: 0,
-        readyToEndAfterExhale: false
-    };
+    const eased = 0.5 - Math.cos(Math.PI * frame.progress) / 2;
+    let scale = 0.72;
+    if (frame.phase.name === 'Inhale') scale = 0.72 + 0.28 * eased;
+    else if (frame.phase.name === 'Exhale') scale = 1 - 0.28 * eased;
+    else if (frame.phase.name === 'Hold') scale = 1;
+    if (reducedMotionQuery?.matches) scale = 0.86;
 
-    // Settings persistence
-    const STORAGE_KEY = 'breathingExercisesSettings';
+    breathForm.style.setProperty('--breath-scale', scale.toFixed(4));
+    screen.dataset.phase = frame.phase.name;
+    phaseWord.textContent = frame.phase.name;
+    countdown.textContent = settings.countdownEnabled ? formatCountdown(frame) : '';
 
-    function saveSettings() {
-        try {
-            const settings = {
-                soundEnabled: state.soundEnabled,
-                countdownEnabled: state.countdownEnabled,
-                exerciseType: state.exerciseType,
-                phaseTime: state.phaseTime,
-                exhaleDuration: state.exhaleDuration
-            };
-            localStorage.setItem(STORAGE_KEY, JSON.stringify(settings));
-        } catch (e) {
-            console.error('Failed to save settings:', e);
-        }
-    }
-
-    function loadSettings() {
-        try {
-            const saved = localStorage.getItem(STORAGE_KEY);
-            if (saved) {
-                const settings = JSON.parse(saved);
-                if (typeof settings.soundEnabled === 'boolean') {
-                    state.soundEnabled = settings.soundEnabled;
-                }
-                if (typeof settings.countdownEnabled === 'boolean') {
-                    state.countdownEnabled = settings.countdownEnabled;
-                }
-                if (settings.exerciseType && exerciseTypes[settings.exerciseType]) {
-                    state.exerciseType = settings.exerciseType;
-                }
-                if (typeof settings.phaseTime === 'number') {
-                    state.phaseTime = settings.phaseTime;
-                }
-                if (typeof settings.exhaleDuration === 'number') {
-                    state.exhaleDuration = settings.exhaleDuration;
-                }
-            }
-        } catch (e) {
-            console.error('Failed to load settings:', e);
-        }
-    }
-
-    // Load settings on startup
-    loadSettings();
-
-    function getCurrentPhases() {
-        const exercise = exerciseTypes[state.exerciseType];
-        if (state.exerciseType === 'longExhale') {
-            return exercise.getPhases(state.phaseTime, state.exhaleDuration);
-        }
-        return exercise.getPhases(state.phaseTime);
-    }
-
-    function getTotalCycleTime() {
-        return getCurrentPhases().reduce((sum, phase) => sum + phase.duration, 0);
-    }
-
-    let wakeLock = null;
-    let audioContext = new (window.AudioContext || window.webkitAudioContext)();
-
-    const offlineNotification = document.getElementById('offline-notification');
-    let hideTimeout = null;
-
-    function updateOnlineStatus() {
-        if (offlineNotification) {
-            if (navigator.onLine) {
-                offlineNotification.style.display = 'none';
-                if (hideTimeout) {
-                    clearTimeout(hideTimeout);
-                    hideTimeout = null;
-                }
-            } else {
-                offlineNotification.style.display = 'block';
-                if (hideTimeout) {
-                    clearTimeout(hideTimeout);
-                }
-                hideTimeout = setTimeout(() => {
-                    offlineNotification.style.display = 'none';
-                    hideTimeout = null;
-                }, 5000);
-            }
-        }
-    }
-
-    window.addEventListener('online', updateOnlineStatus);
-    window.addEventListener('offline', updateOnlineStatus);
-    updateOnlineStatus();
-
-    const icons = {
-        play: `<svg class="icon" viewBox="0 0 24 24"><polygon points="5 3 19 12 5 21 5 3"></polygon></svg>`,
-        pause: `<svg class="icon" viewBox="0 0 24 24"><rect x="6" y="4" width="4" height="16"></rect><rect x="14" y="4" width="4" height="16"></rect></svg>`,
-        volume2: `<svg class="icon" viewBox="0 0 24 24"><polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"></polygon><path d="M19.07 4.93a10 10 0 0 1 0 14.14M15.54 8.46a5 5 0 0 1 0 7.07"></path></svg>`,
-        volumeX: `<svg class="icon" viewBox="0 0 24 24"><polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"></polygon><line x1="23" y1="9" x2="17" y2="15"></line><line x1="17" y1="9" x2="23" y2="15"></line></svg>`,
-        rotateCcw: `<svg class="icon" viewBox="0 0 24 24"><polyline points="1 4 1 10 7 10"></polyline><path d="M3.51 15a9 9 0 1 0 2.13-9.36L1 10"></path></svg>`,
-        clock: `<svg class="icon" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"></circle><polyline points="12 6 12 12 16 14"></polyline></svg>`,
-        hash: `<svg class="icon" viewBox="0 0 24 24"><line x1="4" y1="9" x2="20" y2="9"></line><line x1="4" y1="15" x2="20" y2="15"></line><line x1="10" y1="3" x2="8" y2="21"></line><line x1="16" y1="3" x2="14" y2="21"></line></svg>`
-    };
-
-    function toggleCountdown() {
-        state.countdownEnabled = !state.countdownEnabled;
-        saveSettings();
-        render();
-    }
-
-    function getInstruction(count) {
-        const phases = getCurrentPhases();
-        if (count >= 0 && count < phases.length) {
-            return phases[count].name;
-        }
-        return '';
-    }
-
-    function getPhaseColor(count) {
-        const phases = getCurrentPhases();
-        if (count >= 0 && count < phases.length) {
-            return phases[count].color;
-        }
-        return '#f97316';
-    }
-
-    const phaseColors = ['#f97316', '#fbbf24', '#38bdf8', '#22c55e'];
-
-    function hexToRgba(hex, alpha) {
-        const normalized = hex.replace('#', '');
-        const bigint = parseInt(normalized, 16);
-        const r = (bigint >> 16) & 255;
-        const g = (bigint >> 8) & 255;
-        const b = bigint & 255;
-        return `rgba(${r}, ${g}, ${b}, ${alpha})`;
-    }
-
-    let cachedGradient = null;
-    let cachedGradientKey = '';
-
-    function invalidateGradient() {
-        cachedGradient = null;
-        cachedGradientKey = '';
-    }
-
-    function resizeCanvas() {
-        const currentSizingElement = layoutHost || document.body;
-        if (!currentSizingElement) {
-            return;
-        }
-
-        const rect = currentSizingElement.getBoundingClientRect();
-        const width = rect.width;
-        const height = rect.height;
-        const pixelRatio = Math.min(window.devicePixelRatio || 1, 1.75);
-
-        state.viewportWidth = width;
-        state.viewportHeight = height;
-        state.devicePixelRatio = pixelRatio;
-
-        canvas.style.width = `${width}px`;
-        canvas.style.height = `${height}px`;
-        canvas.width = Math.floor(width * pixelRatio);
-        canvas.height = Math.floor(height * pixelRatio);
-
-        if (ctx) {
-            ctx.setTransform(pixelRatio, 0, 0, pixelRatio, 0, 0);
-        }
-
-        invalidateGradient();
-
-        if (!state.isPlaying) {
-            drawScene({ progress: state.sessionComplete ? 1 : 0, showTrail: false, phase: state.count });
-        }
-    }
-
-    window.addEventListener('resize', resizeCanvas, { passive: true });
-
-    function updateMotionPreference(event) {
-        state.prefersReducedMotion = event.matches;
-        if (!state.isPlaying) {
-            drawScene({ progress: state.sessionComplete ? 1 : 0, showTrail: false, phase: state.count });
-        }
-    }
-
-    const motionQuery = typeof window.matchMedia === 'function'
-        ? window.matchMedia('(prefers-reduced-motion: reduce)')
-        : null;
-
-    if (motionQuery) {
-        state.prefersReducedMotion = motionQuery.matches;
-        if (typeof motionQuery.addEventListener === 'function') {
-            motionQuery.addEventListener('change', updateMotionPreference);
-        } else if (typeof motionQuery.addListener === 'function') {
-            motionQuery.addListener(updateMotionPreference);
-        }
-    }
-
-    function formatTime(seconds) {
-        const mins = Math.floor(seconds / 60);
-        const secs = seconds % 60;
-        return `${mins.toString().padStart(2, '0')}:${secs.toString().padStart(2, '0')}`;
-    }
-
-    function playTone({ isCompletionBell = false } = {}) {
-        if (!state.soundEnabled || !audioContext) return;
-        try {
-            const gainNode = audioContext.createGain();
-            gainNode.connect(audioContext.destination);
-
-            if (isCompletionBell) {
-                const now = audioContext.currentTime;
-                const bellNotes = [880, 1174.66];
-
-                gainNode.gain.setValueAtTime(0.0001, now);
-                gainNode.gain.exponentialRampToValueAtTime(0.45, now + 0.02);
-                gainNode.gain.exponentialRampToValueAtTime(0.0001, now + 1.2);
-
-                bellNotes.forEach((frequency, index) => {
-                    const oscillator = audioContext.createOscillator();
-                    oscillator.type = index === 0 ? 'sine' : 'triangle';
-                    oscillator.frequency.setValueAtTime(frequency, now);
-                    oscillator.connect(gainNode);
-                    oscillator.start(now);
-                    oscillator.stop(now + 1.2);
-                });
-            } else {
-                const oscillator = audioContext.createOscillator();
-                oscillator.type = 'triangle';
-                oscillator.frequency.setValueAtTime(528, audioContext.currentTime);
-                gainNode.gain.setValueAtTime(0, audioContext.currentTime);
-                gainNode.gain.linearRampToValueAtTime(0.5, audioContext.currentTime + 0.01);
-                gainNode.gain.linearRampToValueAtTime(0, audioContext.currentTime + 0.3);
-                oscillator.connect(gainNode);
-                oscillator.start(audioContext.currentTime);
-                oscillator.stop(audioContext.currentTime + 0.3);
-            }
-        } catch (e) {
-            console.error('Error playing tone:', e);
-        }
-    }
-
-    let animationFrameId;
-
-    async function requestWakeLock() {
-        if ('wakeLock' in navigator) {
-            try {
-                wakeLock = await navigator.wakeLock.request('screen');
-                console.log('Wake lock is active');
-            } catch (err) {
-                console.error('Failed to acquire wake lock:', err);
-            }
+    const currentSecond = Math.floor(frame.elapsedMs / 1000);
+    if (currentSecond !== lastDisplayedSecond) {
+        lastDisplayedSecond = currentSecond;
+        if (settings.lastRoutine?.targetType === 'rounds') {
+            const currentRound = Math.min(frame.completedRounds + 1, settings.lastRoutine.targetValue);
+            timer.textContent = `Round ${currentRound} of ${settings.lastRoutine.targetValue}`;
         } else {
-            console.log('Wake Lock API not supported');
+            timer.textContent = formatElapsed(frame.elapsedMs);
         }
     }
 
-    function releaseWakeLock() {
-        if (wakeLock !== null) {
-            wakeLock.release()
-                .then(() => {
-                    wakeLock = null;
-                    console.log('Wake lock released');
-                })
-                .catch(err => {
-                    console.error('Failed to release wake lock:', err);
-                });
+    if (engine.status === 'paused') stateLabel.textContent = 'Paused';
+    else if (engine.status === 'ending') stateLabel.textContent = 'Waiting for you';
+    else if (frame.isFinishing) stateLabel.textContent = 'Finishing this breath';
+    else stateLabel.textContent = EXERCISES[settings.lastRoutine.exerciseId].name;
+}
+
+function formatCountdown(frame) {
+    const seconds = frame.phaseRemainingMs / 1000;
+    const durationHasHalf = frame.phase.duration % 1 !== 0;
+    if (durationHasHalf && seconds > Math.floor(frame.phase.duration)) {
+        return frame.phase.duration.toFixed(1);
+    }
+    return String(Math.max(1, Math.ceil(seconds)));
+}
+
+function handlePhaseChange(frame) {
+    if (currentView !== 'session') return;
+    phaseAnnouncer.textContent = frame.phase.name;
+    if (engine.status === 'running') {
+        playPhaseCue(frame.phase.name);
+        if (frame.phase.name === 'Inhale' || frame.phase.name === 'Exhale') {
+            triggerHaptic('phase');
         }
     }
+}
 
-    function togglePlay() {
-        // Read time limit directly from input before DOM is rebuilt
-        const timeLimitInput = document.getElementById('time-limit');
-        if (timeLimitInput) {
-            state.timeLimit = timeLimitInput.value.replace(/[^0-9]/g, '');
-        }
-        state.isPlaying = !state.isPlaying;
-        if (state.isPlaying) {
-            if (audioContext && audioContext.state === 'suspended') {
-                audioContext.resume().then(() => {
-                    console.log('AudioContext resumed');
-                });
-            }
-            state.hasStarted = true;
-            state.totalTime = 0;
-            const phases = getCurrentPhases();
-            state.countdown = Math.ceil(phases[0].duration);
-            state.count = 0;
-            state.sessionComplete = false;
-            state.timeLimitReached = false;
-            state.readyToEndAfterExhale = false;
-            state.completedRounds = 0;
-            // For 4-7-8, treat timeLimit as rounds instead of minutes
-            if (state.exerciseType === 'fourSevenEight' && state.timeLimit) {
-                state.targetRounds = parseInt(state.timeLimit) || 0;
-            } else {
-                state.targetRounds = 0;
-            }
-            state.pulseStartTime = performance.now();
-            state.startTime = performance.now();
-            playTone();
-            animate();
-            requestWakeLock();
-        } else {
-            cancelAnimationFrame(animationFrameId);
-            state.totalTime = 0;
-            const phases = getCurrentPhases();
-            state.countdown = Math.ceil(phases[0].duration);
-            state.count = 0;
-            state.sessionComplete = false;
-            state.timeLimitReached = false;
-            state.readyToEndAfterExhale = false;
-            state.hasStarted = false;
-            state.targetRounds = 0;
-            state.completedRounds = 0;
-            invalidateGradient();
-            drawScene({ progress: 0, showTrail: false, phase: state.count });
-            state.pulseStartTime = null;
-            state.startTime = null;
-            releaseWakeLock();
-        }
-        render();
-    }
-
-    function resetToStart() {
-        state.isPlaying = false;
-        state.totalTime = 0;
-        const phases = getCurrentPhases();
-        state.countdown = Math.ceil(phases[0].duration);
-        state.count = 0;
-        state.sessionComplete = false;
-        state.timeLimit = '';
-        state.timeLimitReached = false;
-        state.readyToEndAfterExhale = false;
-        state.pulseStartTime = null;
-        state.hasStarted = false;
-        state.startTime = null;
-        state.targetRounds = 0;
-        state.completedRounds = 0;
-        cancelAnimationFrame(animationFrameId);
-        invalidateGradient();
-        drawScene({ progress: 0, showTrail: false, phase: state.count });
+function handleStatusChange(status) {
+    if (status === 'running') {
+        requestWakeLock();
+        scheduleChromeHide();
+    } else {
         releaseWakeLock();
-        render();
+        showSessionChrome(false);
     }
-
-    function toggleSound() {
-        state.soundEnabled = !state.soundEnabled;
-        saveSettings();
-        render();
+    if (currentView === 'session') {
+        const pauseButton = document.querySelector('#pause-button');
+        if (pauseButton) pauseButton.textContent = status === 'paused' ? 'Resume' : 'Pause';
+        if (lastFrame) updateSessionFrame({ ...lastFrame, status });
     }
+}
 
-    function handleTimeLimitChange(e) {
-        state.timeLimit = e.target.value.replace(/[^0-9]/g, '');
+function handleCompletion(payload) {
+    lastCompletion = payload;
+    playCompletionCue();
+    triggerHaptic('completion');
+    currentView = 'complete';
+    clearHideChromeTimer();
+    renderComplete();
+}
+
+function prepareAudio() {
+    if (!settings.soundEnabled) return;
+    try {
+        audioContext ||= new (window.AudioContext || window.webkitAudioContext)();
+        if (audioContext.state === 'suspended') audioContext.resume();
+    } catch (error) {
+        console.warn('Audio cues are not available on this device.', error);
     }
+}
 
-    function setExerciseType(type) {
-        state.exerciseType = type;
-        const exercise = exerciseTypes[type];
-        if (exercise.hasPhaseTimeSlider) {
-            state.phaseTime = exercise.phaseTimeRange.default;
-        }
-        if (type === 'longExhale') {
-            state.exhaleDuration = exercise.phaseTimeRange.default;
-        }
-        saveSettings();
-        render();
-    }
+function playTone(frequency, duration, startOffset = 0, peak = 0.055) {
+    if (!settings.soundEnabled) return;
+    prepareAudio();
+    if (!audioContext) return;
+    const start = audioContext.currentTime + startOffset;
+    const end = start + duration;
+    const gain = audioContext.createGain();
+    const oscillator = audioContext.createOscillator();
+    oscillator.type = 'sine';
+    oscillator.frequency.setValueAtTime(frequency, start);
+    const scaledPeak = peak * (settings.soundVolume / 100);
+    gain.gain.setValueAtTime(0.0001, start);
+    gain.gain.exponentialRampToValueAtTime(Math.max(0.0002, scaledPeak), start + 0.035);
+    gain.gain.exponentialRampToValueAtTime(0.0001, end);
+    oscillator.connect(gain);
+    gain.connect(audioContext.destination);
+    oscillator.start(start);
+    oscillator.stop(end + 0.02);
+}
 
-    function startWithPreset(minutes) {
-        state.timeLimit = minutes.toString();
-        state.targetRounds = 0;
-        state.completedRounds = 0;
-        state.isPlaying = true;
-        state.totalTime = 0;
-        const phases = getCurrentPhases();
-        state.countdown = Math.ceil(phases[0].duration);
-        state.count = 0;
-        state.sessionComplete = false;
-        state.timeLimitReached = false;
-        state.readyToEndAfterExhale = false;
-        state.pulseStartTime = performance.now();
-        state.hasStarted = true;
-        state.startTime = performance.now();
-        if (audioContext && audioContext.state === 'suspended') {
-            audioContext.resume().then(() => {
-                console.log('AudioContext resumed');
-            });
-        }
-        playTone();
-        animate();
-        requestWakeLock();
-        render();
-    }
+function playPhaseCue(phaseName) {
+    const cues = {
+        Inhale: [392, 0.24],
+        Hold: [330, 0.18],
+        Exhale: [293.66, 0.28],
+        Wait: [261.63, 0.16]
+    };
+    const cue = cues[phaseName];
+    if (cue) playTone(cue[0], cue[1]);
+}
 
-    function startWithRounds(rounds) {
-        state.targetRounds = rounds;
-        state.completedRounds = 0;
-        state.timeLimit = '';
-        state.isPlaying = true;
-        state.totalTime = 0;
-        const phases = getCurrentPhases();
-        state.countdown = Math.ceil(phases[0].duration);
-        state.count = 0;
-        state.sessionComplete = false;
-        state.timeLimitReached = false;
-        state.readyToEndAfterExhale = false;
-        state.pulseStartTime = performance.now();
-        state.hasStarted = true;
-        state.startTime = performance.now();
-        if (audioContext && audioContext.state === 'suspended') {
-            audioContext.resume().then(() => {
-                console.log('AudioContext resumed');
-            });
-        }
-        playTone();
-        animate();
-        requestWakeLock();
-        render();
-    }
+function playCompletionCue() {
+    playTone(392, 0.38, 0, 0.065);
+    playTone(523.25, 0.48, 0.3, 0.055);
+}
 
-    function drawScene({ progress = 0, phase = state.count, showTrail = state.isPlaying, timestamp = performance.now() } = {}) {
-        if (!ctx) return;
-
-        const width = state.viewportWidth || canvas.clientWidth || canvas.width;
-        const height = state.viewportHeight || canvas.clientHeight || canvas.height;
-        if (!width || !height) {
+function triggerHaptic(kind) {
+    if (!settings.hapticsEnabled) return;
+    try {
+        if (typeof navigator.vibrate === 'function') {
+            navigator.vibrate(kind === 'completion' ? [18, 70, 18] : 12);
             return;
         }
-
-        const scale = state.devicePixelRatio || 1;
-        ctx.save();
-        ctx.setTransform(scale, 0, 0, scale, 0, 0);
-
-        ctx.clearRect(0, 0, width, height);
-
-        if (!state.hasStarted && !state.sessionComplete) {
-            invalidateGradient();
-            ctx.restore();
-            return;
-        }
-
-        const clampedProgress = Math.max(0, Math.min(1, progress));
-        const easedProgress = 0.5 - (Math.cos(Math.PI * clampedProgress) / 2);
-        const baseSize = Math.min(width, height) * 0.6;
-        const topMargin = 20;
-        const sizeWithoutBreath = Math.min(baseSize, height - topMargin * 2);
-        const verticalOffset = Math.min(height * 0.18, 110);
-        const preferredTop = height / 2 + verticalOffset - sizeWithoutBreath / 2;
-        const top = Math.max(topMargin, Math.min(preferredTop, height - sizeWithoutBreath - topMargin));
-        const left = (width - sizeWithoutBreath) / 2;
-
-        const now = timestamp;
-        const allowMotion = !state.prefersReducedMotion;
-
-        // Get current phase info
-        const phases = getCurrentPhases();
-        const currentPhaseName = phases[phase]?.name || 'Inhale';
-
-        let breathInfluence = 0;
-        if (currentPhaseName === 'Inhale') {
-            breathInfluence = easedProgress;
-        } else if (currentPhaseName === 'Exhale') {
-            breathInfluence = 1 - easedProgress;
-        } else if (allowMotion) {
-            // Hold or Wait phases
-            breathInfluence = 0.3 + 0.2 * (0.5 + 0.5 * Math.sin(now / 350));
-        } else {
-            breathInfluence = 0.3;
-        }
-
-        let pulseBoost = 0;
-        if (allowMotion && state.pulseStartTime !== null) {
-            const pulseElapsed = (now - state.pulseStartTime) / 1000;
-            if (pulseElapsed < 0.6) {
-                pulseBoost = Math.sin((pulseElapsed / 0.6) * Math.PI);
-            }
-        }
-
-        const size = sizeWithoutBreath * (1 + 0.08 * breathInfluence + 0.03 * pulseBoost);
-        const adjustedLeft = left + (sizeWithoutBreath - size) / 2;
-        const adjustedTop = top + (sizeWithoutBreath - size) / 2;
-
-        let accentColor = getPhaseColor(phase);
-        if (state.sessionComplete) {
-            accentColor = '#4ade80';
-        }
-
-        const gradientKey = `${Math.round(size * 100)}-${accentColor}-${Math.round(adjustedLeft)}-${Math.round(adjustedTop)}`;
-        if (!cachedGradient || cachedGradientKey !== gradientKey) {
-            cachedGradient = ctx.createRadialGradient(
-                adjustedLeft + size / 2,
-                adjustedTop + size / 2,
-                size * 0.2,
-                adjustedLeft + size / 2,
-                adjustedTop + size / 2,
-                size
-            );
-            cachedGradient.addColorStop(0, hexToRgba(accentColor, 0.18));
-            cachedGradient.addColorStop(1, 'rgba(0, 0, 0, 0)');
-            cachedGradientKey = gradientKey;
-        }
-        ctx.fillStyle = cachedGradient;
-        ctx.fillRect(0, 0, width, height);
-
-        ctx.restore();
+        // iOS 18 provides a system haptic for native switch controls. A synthetic
+        // click is intentionally only a best-effort fallback and may be declined.
+        hapticProxy?.click();
+        if (kind === 'completion') window.setTimeout(() => hapticProxy?.click(), 140);
+    } catch (error) {
+        // Haptics are supplementary; visual guidance remains authoritative.
     }
+}
 
-    function updateCanvasVisibility() {
-        const shouldShow = state.isPlaying || state.sessionComplete;
-        canvas.classList.toggle('is-visible', shouldShow);
+async function requestWakeLock() {
+    if (document.visibilityState !== 'visible' || engine.status !== 'running' || !('wakeLock' in navigator)) return;
+    try {
+        if (!wakeLockSentinel) {
+            wakeLockSentinel = await navigator.wakeLock.request('screen');
+            wakeLockSentinel.addEventListener('release', () => {
+                wakeLockSentinel = null;
+            }, { once: true });
+        }
+    } catch (error) {
+        wakeLockSentinel = null;
     }
+}
 
-    function animate() {
-        if (!state.isPlaying) return;
-
-        const now = performance.now();
-        const phases = getCurrentPhases();
-        const totalCycleTime = getTotalCycleTime();
-        const exhaleIndex = phases.findIndex(p => p.name === 'Exhale');
-
-        // Calculate absolute timing
-        const totalElapsed = (now - state.startTime) / 1000;
-        const newTotalTime = Math.floor(totalElapsed);
-
-        // Find current phase based on cycle position
-        const cycleElapsed = totalElapsed % totalCycleTime;
-
-        let accumulatedTime = 0;
-        let newCount = 0;
-        let phaseStartTime = 0;
-
-        for (let i = 0; i < phases.length; i++) {
-            if (cycleElapsed >= accumulatedTime && cycleElapsed < accumulatedTime + phases[i].duration) {
-                newCount = i;
-                phaseStartTime = accumulatedTime;
-                break;
-            }
-            accumulatedTime += phases[i].duration;
-        }
-
-        const currentPhaseDuration = phases[newCount].duration;
-        const phaseElapsed = cycleElapsed - phaseStartTime;
-        const progress = phaseElapsed / currentPhaseDuration;
-        const remaining = currentPhaseDuration - phaseElapsed;
-        const hasHalfSecond = currentPhaseDuration % 1 !== 0;
-        let newCountdown;
-        if (hasHalfSecond && remaining > Math.floor(currentPhaseDuration)) {
-            newCountdown = currentPhaseDuration;
-        } else {
-            newCountdown = Math.ceil(remaining);
-        }
-
-        let needsRender = false;
-
-        if (newTotalTime !== state.totalTime) {
-            state.totalTime = newTotalTime;
-            needsRender = true;
-        }
-
-        const previousCount = state.count;
-        state.count = newCount;
-
-        const isPhaseTransition = state.count !== previousCount;
-        const exhaleJustCompleted = isPhaseTransition && exhaleIndex >= 0 && previousCount === exhaleIndex;
-
-        // Track completed rounds for 4-7-8 mode
-        // A round is complete when we transition from last phase (exhale) back to first phase (inhale)
-        if (isPhaseTransition && previousCount === phases.length - 1 && newCount === 0) {
-            state.completedRounds++;
-            needsRender = true;
-
-            // For 4-7-8 with target rounds, check if we've completed all rounds.
-            // Mark it to end on this exhale completion transition.
-            if (state.exerciseType === 'fourSevenEight' && state.targetRounds > 0 && state.completedRounds >= state.targetRounds) {
-                state.readyToEndAfterExhale = true;
-            }
-        }
-
-        const parsedLimit = Number.parseInt(state.timeLimit, 10);
-        const timeLimitSeconds = Number.isFinite(parsedLimit) ? parsedLimit * 60 : 0;
-        if (state.timeLimit && !state.timeLimitReached && totalElapsed >= timeLimitSeconds) {
-            state.timeLimitReached = true;
-            state.readyToEndAfterExhale = true;
-            needsRender = true;
-        }
-
-        const isFinalTransition = exhaleJustCompleted && state.readyToEndAfterExhale;
-
-        if (isPhaseTransition) {
-            state.pulseStartTime = now;
-            playTone({ isCompletionBell: isFinalTransition });
-            needsRender = true;
-        }
-
-        // All exercise endings are aligned to exhale completion.
-        if (exhaleJustCompleted && state.readyToEndAfterExhale) {
-            state.sessionComplete = true;
-            state.isPlaying = false;
-            state.hasStarted = false;
-            state.readyToEndAfterExhale = false;
-            cancelAnimationFrame(animationFrameId);
-            releaseWakeLock();
-            drawScene({ progress: 1, showTrail: false, phase: exhaleIndex >= 0 ? exhaleIndex : previousCount });
-            needsRender = true;
-        }
-
-        if (newCountdown !== state.countdown) {
-            state.countdown = newCountdown;
-            needsRender = true;
-        }
-
-        drawScene({ progress, timestamp: now });
-
-        if (needsRender) {
-            render();
-        }
-
-        if (state.isPlaying) {
-            animationFrameId = requestAnimationFrame(animate);
-        }
+async function releaseWakeLock() {
+    if (!wakeLockSentinel) return;
+    const sentinel = wakeLockSentinel;
+    wakeLockSentinel = null;
+    try {
+        await sentinel.release();
+    } catch (error) {
+        // The browser may already have released it during an interruption.
     }
+}
 
+function showSessionChrome(schedule = true) {
+    document.querySelector('#session-screen')?.classList.remove('chrome-hidden');
+    if (schedule && engine.status === 'running' && !settingsOpen) scheduleChromeHide();
+}
 
-    function render() {
-        const exercise = exerciseTypes[state.exerciseType];
-        const phases = getCurrentPhases();
+function scheduleChromeHide() {
+    clearHideChromeTimer();
+    if (currentView !== 'session' || engine.status !== 'running' || settingsOpen) return;
+    hideChromeTimer = window.setTimeout(() => {
+        document.querySelector('#session-screen')?.classList.add('chrome-hidden');
+    }, 5000);
+}
 
-        let html = `
-            <h1>${exercise.name}</h1>
-        `;
+function clearHideChromeTimer() {
+    if (hideChromeTimer) window.clearTimeout(hideChromeTimer);
+    hideChromeTimer = null;
+}
 
-        if (state.isPlaying) {
-            // Timer display - show rounds for 4-7-8, time for others
-            if (state.exerciseType === 'fourSevenEight' && state.targetRounds > 0) {
-                html += `<div class="timer">Round ${state.completedRounds + 1} of ${state.targetRounds}</div>`;
-            } else {
-                html += `<div class="timer">Total Time: ${formatTime(state.totalTime)}</div>`;
-            }
-            html += `<div class="instruction">${getInstruction(state.count)}</div>`;
-            // Show countdown number if enabled
-            if (state.countdownEnabled) {
-                const countdownDisplay = state.countdown % 1 !== 0 ? state.countdown.toFixed(1) : state.countdown;
-                html += `<div class="countdown">${countdownDisplay}</div>`;
-            }
-            html += `<div class="phase-tracker">`;
-            phases.forEach((phase, index) => {
-                const phaseColor = phase.color;
-                const softPhaseColor = hexToRgba(phaseColor, 0.25);
-                html += `
-                    <div class="phase-item ${index === state.count ? 'active' : ''}" style="--phase-color: ${phaseColor}; --phase-soft: ${softPhaseColor};">
-                        <span class="phase-dot"></span>
-                        <span class="phase-label">${phase.name}</span>
-                    </div>
-                `;
+function isStandalone() {
+    return window.matchMedia?.('(display-mode: standalone)').matches || window.navigator.standalone === true;
+}
+
+async function installApp() {
+    if (!deferredInstallPrompt) return;
+    await deferredInstallPrompt.prompt();
+    await deferredInstallPrompt.userChoice;
+    deferredInstallPrompt = null;
+    if (settingsOpen) renderSettingsSheet();
+}
+
+function showToast(message, actionLabel = '', action = null, timeout = 5000) {
+    if (toastTimer) window.clearTimeout(toastTimer);
+    toastAction = action;
+    toast.innerHTML = `<span>${escapeHtml(message)}</span>${actionLabel ? `<button type="button" data-toast-action>${escapeHtml(actionLabel)}</button>` : ''}`;
+    toast.setAttribute('aria-hidden', 'false');
+    if (timeout > 0) {
+        toastTimer = window.setTimeout(hideToast, timeout);
+    }
+}
+
+function hideToast() {
+    toast.setAttribute('aria-hidden', 'true');
+    toastAction = null;
+    toastTimer = null;
+}
+
+function showUpdateToast() {
+    const sessionActive = ['running', 'paused', 'ending'].includes(engine.status);
+    if (sessionActive) showToast('An update is ready after this session.', '', null, 5000);
+    else showToast('A quieter update is ready.', 'Update', applyUpdate, 0);
+}
+
+async function registerServiceWorker() {
+    if (!('serviceWorker' in navigator)) return;
+    try {
+        serviceWorkerRegistration = await navigator.serviceWorker.register('./service-worker.js');
+        if (serviceWorkerRegistration.waiting) {
+            updateReady = true;
+            showUpdateToast();
+        }
+        serviceWorkerRegistration.addEventListener('updatefound', () => {
+            const worker = serviceWorkerRegistration.installing;
+            worker?.addEventListener('statechange', () => {
+                if (worker.state === 'installed' && navigator.serviceWorker.controller) {
+                    updateReady = true;
+                    showUpdateToast();
+                    if (settingsOpen) renderSettingsSheet();
+                }
             });
-            html += `</div>`;
-        }
-
-        if (state.timeLimitReached && !state.sessionComplete) {
-            const limitMessage = state.isPlaying ? 'Finishing current cycle...' : 'Time limit reached';
-            html += `<div class="limit-warning">${limitMessage}</div>`;
-        }
-
-        if (!state.isPlaying && !state.sessionComplete) {
-            // Exercise type selector
-            html += `<div class="exercise-selector">`;
-            Object.entries(exerciseTypes).forEach(([key, ex]) => {
-                html += `
-                    <button class="exercise-button ${state.exerciseType === key ? 'active' : ''}" data-exercise="${key}">
-                        ${ex.name}
-                    </button>
-                `;
-            });
-            html += `</div>`;
-
-            html += `<p class="exercise-description">${exercise.description}</p>`;
-
-            html += `
-                <div class="settings">
-                    <div class="form-group">
-                        <label class="switch">
-                            <input type="checkbox" id="sound-toggle" ${state.soundEnabled ? 'checked' : ''}>
-                            <span class="slider"></span>
-                        </label>
-                        <label for="sound-toggle">
-                            ${state.soundEnabled ? icons.volume2 : icons.volumeX}
-                            Sound ${state.soundEnabled ? 'On' : 'Off'}
-                        </label>
-                    </div>
-                    <div class="form-group">
-                        <label class="switch">
-                            <input type="checkbox" id="countdown-toggle" ${state.countdownEnabled ? 'checked' : ''}>
-                            <span class="slider"></span>
-                        </label>
-                        <label for="countdown-toggle">
-                            ${icons.hash}
-                            Countdown ${state.countdownEnabled ? 'On' : 'Off'}
-                        </label>
-                    </div>
-                    <div class="form-group">
-                        <input
-                            type="number"
-                            inputmode="numeric"
-                            placeholder="${state.exerciseType === 'fourSevenEight' ? 'Rounds' : 'Time limit (minutes)'}"
-                            value="${state.timeLimit}"
-                            id="time-limit"
-                            step="1"
-                            min="0"
-                        >
-                        <label for="time-limit">${state.exerciseType === 'fourSevenEight' ? 'Rounds (optional)' : 'Minutes (optional)'}</label>
-                    </div>
-                </div>
-                <div class="prompt">Press start to begin</div>
-            `;
-        }
-
-        if (state.sessionComplete) {
-            html += `<div class="complete">Complete!</div>`;
-        }
-
-        if (!state.sessionComplete) {
-            html += `
-                <button id="toggle-play">
-                    ${state.isPlaying ? icons.pause : icons.play}
-                    ${state.isPlaying ? 'Pause' : 'Start'}
-                </button>
-            `;
-        }
-
-        if (!state.isPlaying && !state.sessionComplete && exercise.hasPhaseTimeSlider) {
-            const range = exercise.phaseTimeRange;
-            const currentValue = state.exerciseType === 'longExhale' ? state.exhaleDuration : state.phaseTime;
-            html += `
-                <div class="slider-container">
-                    <label for="phase-time-slider">${exercise.phaseTimeLabel} (seconds): <span id="phase-time-value">${currentValue}</span></label>
-                    <input type="range" min="${range.min}" max="${range.max}" step="${range.step}" value="${currentValue}" id="phase-time-slider">
-                </div>
-            `;
-        }
-
-        if (state.sessionComplete) {
-            html += `
-                <button id="reset">
-                    ${icons.rotateCcw}
-                    Back to Start
-                </button>
-            `;
-        }
-
-        if (!state.isPlaying && !state.sessionComplete) {
-            if (state.exerciseType === 'fourSevenEight') {
-                // Rounds-based presets for 4-7-8
-                html += `
-                    <div class="shortcut-buttons">
-                        <button id="preset-4rounds" class="preset-button">
-                            ${icons.clock} 4 rounds
-                        </button>
-                        <button id="preset-6rounds" class="preset-button">
-                            ${icons.clock} 6 rounds
-                        </button>
-                        <button id="preset-8rounds" class="preset-button">
-                            ${icons.clock} 8 rounds
-                        </button>
-                    </div>
-                `;
-            } else {
-                // Minutes-based presets for other exercises
-                html += `
-                    <div class="shortcut-buttons">
-                        <button id="preset-2min" class="preset-button">
-                            ${icons.clock} 2 min
-                        </button>
-                        <button id="preset-5min" class="preset-button">
-                            ${icons.clock} 5 min
-                        </button>
-                        <button id="preset-10min" class="preset-button">
-                            ${icons.clock} 10 min
-                        </button>
-                    </div>
-                `;
-            }
-        }
-
-        app.innerHTML = html;
-
-        updateCanvasVisibility();
-
-        if (!state.sessionComplete) {
-            document.getElementById('toggle-play').addEventListener('click', togglePlay);
-        }
-        if (state.sessionComplete) {
-            document.getElementById('reset').addEventListener('click', resetToStart);
-        }
-        if (!state.isPlaying && !state.sessionComplete) {
-            document.getElementById('sound-toggle').addEventListener('change', toggleSound);
-            document.getElementById('countdown-toggle').addEventListener('change', toggleCountdown);
-            const timeLimitInput = document.getElementById('time-limit');
-            timeLimitInput.addEventListener('input', handleTimeLimitChange);
-
-            // Exercise type buttons
-            document.querySelectorAll('.exercise-button').forEach(btn => {
-                btn.addEventListener('click', () => {
-                    setExerciseType(btn.dataset.exercise);
-                });
-            });
-
-            // Phase time slider
-            const phaseTimeSlider = document.getElementById('phase-time-slider');
-            if (phaseTimeSlider) {
-                phaseTimeSlider.addEventListener('input', function () {
-                    const value = parseFloat(this.value);
-                    if (state.exerciseType === 'longExhale') {
-                        state.exhaleDuration = value;
-                    } else {
-                        state.phaseTime = value;
-                    }
-                    document.getElementById('phase-time-value').textContent = value;
-                    saveSettings();
-                });
-            }
-
-            // Preset buttons - rounds for 4-7-8, minutes for others
-            if (state.exerciseType === 'fourSevenEight') {
-                document.getElementById('preset-4rounds').addEventListener('click', () => startWithRounds(4));
-                document.getElementById('preset-6rounds').addEventListener('click', () => startWithRounds(6));
-                document.getElementById('preset-8rounds').addEventListener('click', () => startWithRounds(8));
-            } else {
-                document.getElementById('preset-2min').addEventListener('click', () => startWithPreset(2));
-                document.getElementById('preset-5min').addEventListener('click', () => startWithPreset(5));
-                document.getElementById('preset-10min').addEventListener('click', () => startWithPreset(10));
-            }
-        }
-        if (!state.isPlaying) {
-            drawScene({ progress: state.sessionComplete ? 1 : 0, phase: state.count, showTrail: false });
-        }
+        });
+    } catch (error) {
+        console.warn('Offline installation is not available in this context.', error);
     }
+}
 
-    render();
-    resizeCanvas();
+function applyUpdate() {
+    if (!serviceWorkerRegistration?.waiting || ['running', 'paused', 'ending'].includes(engine.status)) return;
+    isRefreshingForUpdate = true;
+    serviceWorkerRegistration.waiting.postMessage({ type: 'SKIP_WAITING' });
+}
+
+app.addEventListener('click', handleAppClick);
+app.addEventListener('input', handleInput);
+settingsLayer.addEventListener('input', handleInput);
+settingsLayer.addEventListener('change', handleChange);
+settingsLayer.addEventListener('click', handleSettingsClick);
+
+toast.addEventListener('click', (event) => {
+    if (event.target.closest('[data-toast-action]') && toastAction) toastAction();
 });
+
+window.addEventListener('beforeinstallprompt', (event) => {
+    event.preventDefault();
+    deferredInstallPrompt = event;
+    if (settingsOpen) renderSettingsSheet();
+});
+
+window.addEventListener('appinstalled', () => {
+    deferredInstallPrompt = null;
+    showToast('Quiet Breath is installed.', '', null, 3500);
+    if (settingsOpen) renderSettingsSheet();
+});
+
+window.addEventListener('online', () => {
+    showToast('Back online. Quiet Breath remains ready offline.', '', null, 3500);
+    if (settingsOpen) renderSettingsSheet();
+});
+
+window.addEventListener('offline', () => {
+    showToast('You are offline. Quiet Breath will work normally.', '', null, 4500);
+    if (settingsOpen) renderSettingsSheet();
+});
+
+navigator.serviceWorker?.addEventListener('controllerchange', () => {
+    if (isRefreshingForUpdate) window.location.reload();
+});
+
+document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'hidden' && engine.status === 'running') {
+        pausedByInterruption = engine.pause('interruption');
+    } else if (document.visibilityState === 'visible' && pausedByInterruption) {
+        pausedByInterruption = false;
+        showSessionChrome(false);
+        showToast('Paused while you were away.', '', null, 3500);
+    }
+});
+
+document.addEventListener('keydown', (event) => {
+    const target = event.target;
+    const isFormControl = target instanceof HTMLInputElement || target instanceof HTMLButtonElement || target instanceof HTMLTextAreaElement || target instanceof HTMLSelectElement;
+    if (event.key === 'Escape') {
+        if (settingsOpen) closeSettings();
+        else if (engine.status === 'ending') {
+            clearEndConfirmation();
+            engine.cancelEnding();
+        } else if (currentView === 'session') showSessionChrome();
+    } else if (event.code === 'Space' && currentView === 'session' && !isFormControl && !settingsOpen) {
+        event.preventDefault();
+        if (engine.status === 'running') engine.pause('user');
+        else if (engine.status === 'paused') engine.resume();
+    }
+});
+
+document.addEventListener('pointerdown', () => {
+    if (currentView === 'session') showSessionChrome();
+}, { passive: true });
+
+document.addEventListener('mousemove', () => {
+    if (currentView === 'session' && engine.status === 'running') showSessionChrome();
+}, { passive: true });
+
+document.addEventListener('focusin', () => {
+    if (currentView === 'session') showSessionChrome();
+});
+
+reducedMotionQuery?.addEventListener?.('change', () => {
+    if (lastFrame) updateSessionFrame(lastFrame);
+});
+
+document.body.classList.toggle('extra-dim', settings.extraDim);
+render();
+registerServiceWorker();
