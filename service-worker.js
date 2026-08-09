@@ -1,85 +1,70 @@
-const CACHE_NAME = 'breathing-exercises-cache-v20'; // Versioned cache name
-const urlsToCache = [
-  './',
-  './index.html',
-  './app.js',           // Replace with your app's JS file
-  './manifest.json',    // Replace with your manifest file
-  './icons/icon-192x192.PNG', // Adjusted to match actual filenames
-  './icons/icon-512x512.PNG'
+const CACHE_PREFIX = 'quiet-breath-shell-';
+const CACHE_NAME = `${CACHE_PREFIX}v21`;
+const APP_SHELL = [
+    './index.html',
+    './styles.css',
+    './app.js',
+    './session-engine.js',
+    './manifest.json',
+    './icons/icon-180x180.png',
+    './icons/icon-192x192.PNG',
+    './icons/icon-512x512.PNG',
+    './icons/icon-maskable-512.png'
 ];
-// Install event - cache assets
-self.addEventListener('install', event => {
-  event.waitUntil(
-    caches.open(CACHE_NAME)
-      .then(cache => {
-        console.log('Opened cache:', CACHE_NAME);
-        return cache.addAll(urlsToCache);
-      })
-      .catch(error => {
-        console.error('Cache addAll failed:', error);
-      })
-  );
-  // Activate immediately
-  self.skipWaiting();
+
+self.addEventListener('install', (event) => {
+    event.waitUntil(
+        caches.open(CACHE_NAME).then((cache) => cache.addAll(APP_SHELL))
+    );
 });
-// Activate event - clean up old caches
-self.addEventListener('activate', event => {
-  const cacheWhitelist = [CACHE_NAME];
-  event.waitUntil(
-    caches.keys().then(cacheNames => {
-      return Promise.all(
-        cacheNames.map(cacheName => {
-          if (cacheWhitelist.indexOf(cacheName) === -1) {
-            console.log('Deleting old cache:', cacheName);
-            return caches.delete(cacheName);
-          }
-        })
-      );
-    }).then(() => {
-      // Take control of clients immediately
-      return self.clients.claim();
-    })
-  );
+
+self.addEventListener('activate', (event) => {
+    event.waitUntil((async () => {
+        const cacheNames = await caches.keys();
+        await Promise.all(
+            cacheNames
+                .filter((name) => name.startsWith(CACHE_PREFIX) && name !== CACHE_NAME)
+                .map((name) => caches.delete(name))
+        );
+        await self.clients.claim();
+    })());
 });
-// Fetch event - serve from cache or network
-self.addEventListener('fetch', event => {
-  event.respondWith(
-    caches.match(event.request)
-      .then(response => {
-        if (response) {
-          console.log('Serving from cache:', event.request.url);
-          return response;
+
+self.addEventListener('fetch', (event) => {
+    const request = event.request;
+    if (request.method !== 'GET') return;
+
+    const requestUrl = new URL(request.url);
+    if (requestUrl.origin !== self.location.origin) return;
+
+    if (request.mode === 'navigate') {
+        event.respondWith((async () => {
+            const cachedShell = await caches.match('./index.html');
+            if (cachedShell) return cachedShell;
+            try {
+                return await fetch(request);
+            } catch (error) {
+                return new Response('Quiet Breath is offline and still preparing its local copy.', {
+                    status: 503,
+                    headers: { 'Content-Type': 'text/plain; charset=utf-8' }
+                });
+            }
+        })());
+        return;
+    }
+
+    event.respondWith((async () => {
+        const cached = await caches.match(request);
+        if (cached) return cached;
+        const response = await fetch(request);
+        if (response.ok && response.type === 'basic') {
+            const cache = await caches.open(CACHE_NAME);
+            await cache.put(request, response.clone());
         }
-        // Clone the request for fetching
-        const fetchRequest = event.request.clone();
-        return fetch(fetchRequest)
-          .then(response => {
-            // Validate response
-            if (!response || response.status !== 200 || response.type !== 'basic') {
-              return response;
-            }
-            // Clone and cache the response
-            const responseToCache = response.clone();
-            caches.open(CACHE_NAME)
-              .then(cache => {
-                console.log('Caching new resource:', event.request.url);
-                cache.put(event.request, responseToCache);
-              });
-            return response;
-          })
-          .catch(() => {
-            console.log('Fetch failed, serving fallback:', event.request.url);
-            // Fallback to index.html for navigation requests
-            if (event.request.mode === 'navigate') {
-              return caches.match('./index.html');
-            }
-          });
-      })
-  );
+        return response;
+    })());
 });
-// Handle skip waiting messages
-self.addEventListener('message', event => {
-  if (event.data && event.data.type === 'SKIP_WAITING') {
-    self.skipWaiting();
-  }
+
+self.addEventListener('message', (event) => {
+    if (event.data?.type === 'SKIP_WAITING') self.skipWaiting();
 });
